@@ -1,97 +1,88 @@
-# main.py
+# main.py — in-sample selection, out-of-sample validation, cost sensitivity
 import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from data import get_data
-from signals import composite_signal
-from portfolio import backtest_with_scheme
-from optimize import equal_weight, min_variance, risk_parity
-from metrics import performance
-from analysis import rolling_sharpe, attribution
+from strategy import (get_data, composite_signal, equal_weight,
+                      inverse_volatility, min_variance, backtest, metrics)
 
+pd.set_option("display.width", 120)
+RF = 0.04
+COST_BPS = 10          # base transaction cost assumption
+SCHEMES = {"Equal Weight": equal_weight,
+           "Min Variance": min_variance,
+           "Inverse Vol":  inverse_volatility}
+
+def prep(start, end):
+    px = get_data(start, end)
+    rets = px.pct_change().dropna()
+    sig = composite_signal(px, rets).reindex(rets.index)
+    return px, rets, sig
+
+def spy_returns(start, end, index):
+    spy = get_data(start, end, tickers=["SPY"])["SPY"]
+    return spy.pct_change().reindex(index).dropna()
 
 def main():
-    # ---- 1. Load data ----
-    prices, bench = get_data()
-    returns = prices.pct_change().dropna()
-    bench_ret = bench.pct_change().reindex(returns.index).dropna()
-    print(f"Loaded {prices.shape[1]} stocks + SPY, {prices.shape[0]} days\n")
+    # ================= IN-SAMPLE: 2019-2021, select scheme =================
+    print("="*70); print("IN-SAMPLE 2019-2021 — scheme selection (net of 10bps)"); print("="*70)
+    _, rets_is, sig_is = prep("2019-01-01", "2022-01-01")
+    is_rows = {}
+    for name, fn in SCHEMES.items():
+        net, tno = backtest(sig_is, rets_is, fn, cost_bps=COST_BPS)
+        is_rows[name] = metrics(net, RF, tno)
+    is_df = pd.DataFrame(is_rows).T
+    print(is_df.round(3).to_string())
+    best = is_df["Sharpe"].idxmax()
+    print(f"\n>> Selected (max in-sample Sharpe): {best}")
 
-    # ---- 2. Composite signal ----
-    signal = composite_signal(prices, returns).reindex(returns.index)
+    # ================= OUT-OF-SAMPLE: 2022-2023, frozen =================
+    print("\n"+"="*70); print(f"OUT-OF-SAMPLE 2022-2023 — frozen scheme: {best}"); print("="*70)
+    _, rets_oos, sig_oos = prep("2022-01-01", "2024-01-01")
+    net_oos, tno_oos = backtest(sig_oos, rets_oos, SCHEMES[best], cost_bps=COST_BPS)
+    m_oos = metrics(net_oos, RF, tno_oos)
+    print(pd.Series(m_oos).round(3).to_string())
 
-    # ---- 3. Compare allocation schemes (Phase 2) ----
-    schemes = {
-        "Equal Weight": equal_weight,
-        "Min Variance": min_variance,
-        "Risk Parity":  risk_parity,
-    }
-    os.makedirs("results", exist_ok=True)
-    rows = {}
-    scheme_returns = {}
-    scheme_held = {}
+    spy_oos = spy_returns("2022-01-01", "2024-01-01", net_oos.index)
+    m_spy = metrics(spy_oos, RF)
+    print("\nSPY (out-of-sample):")
+    print(pd.Series(m_spy).round(3).to_string())
 
-    plt.figure(figsize=(10, 6))
-    for name, fn in schemes.items():
-        pr, held = backtest_with_scheme(signal, returns, fn, top_pct=0.3, rebalance_days=5)
-        scheme_returns[name] = pr
-        scheme_held[name] = held
-        rows[name] = {k: round(v, 3) for k, v in performance(pr, bench_ret).items()}
-        cum = (1 + pr).cumprod()
-        plt.plot(cum.index, cum.values, label=name)
+    # OOS equity curve chart
+    os.makedirs("charts", exist_ok=True)
+    pc = (1+net_oos).cumprod(); pc = pc/pc.iloc[0]*100
+    bc = (1+spy_oos.reindex(net_oos.index).fillna(0)).cumprod(); bc = bc/bc.iloc[0]*100
+    plt.figure(figsize=(9,5))
+    plt.plot(pc.index, pc.values, label=f"{best} (net 10bps)")
+    plt.plot(bc.index, bc.values, "--", label="SPY")
+    plt.title("Out-of-Sample: Strategy vs SPY (2022-2023)")
+    plt.ylabel("Growth of 100"); plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig("charts/oos_vs_spy.png", dpi=150); plt.close()
 
-    cum_b = (1 + bench_ret).cumprod()
-    plt.plot(cum_b.index, cum_b.values, label="SPY", linestyle="--", color="black")
-    rows["SPY"] = {k: round(v, 3) for k, v in performance(bench_ret).items()}
-    plt.title("Portfolio Allocation Schemes vs SPY")
-    plt.xlabel("Date"); plt.ylabel("Cumulative Return (NAV)")
-    plt.legend(); plt.grid(True, alpha=0.3)
-    plt.savefig("results/allocation_schemes.png", dpi=150, bbox_inches="tight")
-    plt.close()
+    # ================= COST SENSITIVITY: full period =================
+    print("\n"+"="*70); print("COST SENSITIVITY 2019-2023 — net Sharpe by cost"); print("="*70)
+    _, rets_all, sig_all = prep("2019-01-01", "2024-01-01")
+    cost_rows = {}
+    for name, fn in SCHEMES.items():
+        row = {}
+        for bps in [0, 5, 10, 20]:
+            net, _ = backtest(sig_all, rets_all, fn, cost_bps=bps)
+            row[f"{bps}bps"] = metrics(net, RF)["Sharpe"]
+        cost_rows[name] = row
+    cost_df = pd.DataFrame(cost_rows).T
+    print(cost_df.round(3).to_string())
 
-    print("=== Allocation Schemes vs SPY ===")
-    print(pd.DataFrame(rows).to_string())
+    plt.figure(figsize=(9,5))
+    for name in cost_df.index:
+        plt.plot([0,5,10,20], cost_df.loc[name].values, marker="o", label=name)
+    plt.title("Sharpe vs Transaction Cost"); plt.xlabel("Cost (bps)"); plt.ylabel("Net Sharpe")
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    plt.savefig("charts/cost_sensitivity.png", dpi=150); plt.close()
 
-    # ---- 4. Phase 3a: Rolling Sharpe (use Equal Weight, the best scheme) ----
-    best = "Equal Weight"
-    rs = rolling_sharpe(scheme_returns[best], window=126)
-    rs_bench = rolling_sharpe(bench_ret, window=126)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(rs.index, rs.values, label=f"{best} Portfolio")
-    plt.plot(rs_bench.index, rs_bench.values, label="SPY", linestyle="--", color="black")
-    plt.axhline(0, color="gray", linewidth=0.8)
-    plt.title("Rolling 6-Month Sharpe Ratio")
-    plt.xlabel("Date"); plt.ylabel("Rolling Sharpe (annualised)")
-    plt.legend(); plt.grid(True, alpha=0.3)
-    plt.savefig("results/rolling_sharpe.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("\nSaved results/rolling_sharpe.png")
-    print(f"Rolling Sharpe range for {best}: {rs.min():.2f} to {rs.max():.2f}")
-
-    # ---- 5. Phase 3b: Performance attribution (Equal Weight) ----
-    contrib, top, bottom = attribution(scheme_held[best], returns, top_n=10)
-    print(f"\n=== Top contributors ({best}) ===")
-    print(top.round(4).to_string())
-    print(f"\n=== Bottom contributors ({best}) ===")
-    print(bottom.round(4).to_string())
-
-    plt.figure(figsize=(10, 6))
-    combined = pd.concat([top, bottom])
-    colors = ["#5cb85c" if v >= 0 else "#d9534f" for v in combined.values]
-    plt.bar(combined.index, combined.values, color=colors)
-    plt.axhline(0, color="black", linewidth=0.8)
-    plt.title(f"Top & Bottom Return Contributors ({best})")
-    plt.xlabel("Stock"); plt.ylabel("Total Return Contribution")
-    plt.xticks(rotation=45)
-    plt.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("results/attribution.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("\nSaved results/attribution.png")
-
+    print("\nSaved charts to charts/. Done.")
 
 if __name__ == "__main__":
     main()
